@@ -187,6 +187,21 @@ public sealed class TunnelService : IDisposable
                 }
                 _upstreamReady = true;
 
+                // Proactive SYNC: if HELLO_OK didn't include a peer ID, ask
+                // the cloud function for it right away. Without this, peer
+                // discovery can take up to the periodic ping/sync interval
+                // (~30s); with it, peer is typically known after one
+                // round-trip (~200ms).
+                if (!Relay && string.IsNullOrEmpty(_peerConnId))
+                {
+                    try
+                    {
+                        Log("HELLO_OK had no peer; sending proactive SYNC for discovery");
+                        await WsSendUpstream(Protocol.Encode(Protocol.MsgSync, 0), ct);
+                    }
+                    catch (Exception ex) { Log($"Proactive SYNC failed: {ex.Message}"); }
+                }
+
                 // Start listener if not already running
                 EnsureListenerRunning(ct);
 

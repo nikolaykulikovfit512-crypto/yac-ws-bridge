@@ -286,6 +286,24 @@ func (u *Upstream) Run(ctx context.Context) {
 			log.Println("[DEBUG] sent initial PING for fast discovery")
 		}
 
+		// Proactive SYNC: if HELLO_OK didn't include a peer ID, ask the cloud
+		// function for it right away. The initial PING above tells the cloud to
+		// notify the OTHER side about us; SYNC asks the cloud to tell US about
+		// the other side. Without this, our local peerConnID stays empty until
+		// the next periodic ping/sync cycle (~30s) or until the first incoming
+		// TCP connection triggers waitForPeer(). With it, peer is typically
+		// known after one round-trip (~200ms).
+		u.mu.Lock()
+		needSync := u.peerConnID == ""
+		u.mu.Unlock()
+		if needSync {
+			f := protocol.Encode(protocol.Frame{Type: protocol.MsgSync})
+			u.writeMu.Lock()
+			ws.WriteMessage(websocket.BinaryMessage, f)
+			u.writeMu.Unlock()
+			log.Println("[DEBUG] HELLO_OK had no peer; sent proactive SYNC")
+		}
+
 		readCtx, readCancel := context.WithCancel(ctx)
 		captured := ws
 		go func() {
