@@ -77,12 +77,24 @@ func DecodeHello(payload []byte) (version byte, token string, err error) {
 }
 
 // EncodeHelloOK builds a HELLO_OK payload:
-// [2B ownIdLen][ownId][2B peerIdLen][peerId][2B tokenLen][iamToken]
-func EncodeHelloOK(ownID, peerID, iamToken string) []byte {
+// [2B ownIdLen][ownId][2B peerIdLen][peerId][2B tokenLen][iamToken][1B helperShortID?]
+//
+// helperShortID is appended only when nonzero (multi-helper mode). The cloud
+// function assigns each helper a unique 1-byte ID 1..255 that the helper then
+// stamps into the top byte of every streamID it allocates; this lets the
+// adapter route per-stream frames back to the right helper. shortID==0 means
+// "unassigned / legacy single-helper" — the helper allocates plain streamIDs.
+// Adapter-bound HELLO_OK is fine with shortID==0; only helper-bound HELLO_OK
+// carries a real value.
+func EncodeHelloOK(ownID, peerID, iamToken string, helperShortID byte) []byte {
 	o := []byte(ownID)
 	p := []byte(peerID)
 	t := []byte(iamToken)
-	buf := make([]byte, 2+len(o)+2+len(p)+2+len(t))
+	extra := 0
+	if helperShortID != 0 {
+		extra = 1
+	}
+	buf := make([]byte, 2+len(o)+2+len(p)+2+len(t)+extra)
 	off := 0
 	binary.BigEndian.PutUint16(buf[off:], uint16(len(o)))
 	off += 2
@@ -95,19 +107,24 @@ func EncodeHelloOK(ownID, peerID, iamToken string) []byte {
 	binary.BigEndian.PutUint16(buf[off:], uint16(len(t)))
 	off += 2
 	copy(buf[off:], t)
+	off += len(t)
+	if extra == 1 {
+		buf[off] = helperShortID
+	}
 	return buf
 }
 
-// DecodeHelloOK parses a HELLO_OK payload.
-func DecodeHelloOK(payload []byte) (ownID, peerID, iamToken string, err error) {
+// DecodeHelloOK parses a HELLO_OK payload. The trailing helperShortID byte is
+// optional; if missing it is reported as 0 (legacy single-helper mode).
+func DecodeHelloOK(payload []byte) (ownID, peerID, iamToken string, helperShortID byte, err error) {
 	if len(payload) < 6 {
-		return "", "", "", errors.New("HELLO_OK payload too short")
+		return "", "", "", 0, errors.New("HELLO_OK payload too short")
 	}
 	off := 0
 	oLen := int(binary.BigEndian.Uint16(payload[off:]))
 	off += 2
 	if off+oLen+2 > len(payload) {
-		return "", "", "", errors.New("HELLO_OK: bad ownID length")
+		return "", "", "", 0, errors.New("HELLO_OK: bad ownID length")
 	}
 	ownID = string(payload[off : off+oLen])
 	off += oLen
@@ -115,7 +132,7 @@ func DecodeHelloOK(payload []byte) (ownID, peerID, iamToken string, err error) {
 	pLen := int(binary.BigEndian.Uint16(payload[off:]))
 	off += 2
 	if off+pLen+2 > len(payload) {
-		return "", "", "", errors.New("HELLO_OK: bad peerID length")
+		return "", "", "", 0, errors.New("HELLO_OK: bad peerID length")
 	}
 	peerID = string(payload[off : off+pLen])
 	off += pLen
@@ -123,18 +140,34 @@ func DecodeHelloOK(payload []byte) (ownID, peerID, iamToken string, err error) {
 	tLen := int(binary.BigEndian.Uint16(payload[off:]))
 	off += 2
 	if off+tLen > len(payload) {
-		return "", "", "", errors.New("HELLO_OK: bad token length")
+		return "", "", "", 0, errors.New("HELLO_OK: bad token length")
 	}
 	iamToken = string(payload[off : off+tLen])
+	off += tLen
+
+	// Optional trailing helperShortID byte (multi-helper mode).
+	if off < len(payload) {
+		helperShortID = payload[off]
+	}
 	return
 }
 
 // EncodePeerConn builds a PEER_CONN payload:
-// [2B peerIdLen][peerId][2B tokenLen][iamToken]
-func EncodePeerConn(peerID, iamToken string) []byte {
+// [2B peerIdLen][peerId][2B tokenLen][iamToken][1B helperShortID?]
+//
+// helperShortID is appended only when nonzero. It is used in the
+// cloud-function → adapter direction to identify which helper is announcing
+// itself in multi-helper mode. adapter → helper PEER_CONN (telling a helper
+// about the adapter) always omits it (single adapter; helpers don't need an
+// adapter shortID).
+func EncodePeerConn(peerID, iamToken string, helperShortID byte) []byte {
 	p := []byte(peerID)
 	t := []byte(iamToken)
-	buf := make([]byte, 2+len(p)+2+len(t))
+	extra := 0
+	if helperShortID != 0 {
+		extra = 1
+	}
+	buf := make([]byte, 2+len(p)+2+len(t)+extra)
 	off := 0
 	binary.BigEndian.PutUint16(buf[off:], uint16(len(p)))
 	off += 2
@@ -143,19 +176,24 @@ func EncodePeerConn(peerID, iamToken string) []byte {
 	binary.BigEndian.PutUint16(buf[off:], uint16(len(t)))
 	off += 2
 	copy(buf[off:], t)
+	off += len(t)
+	if extra == 1 {
+		buf[off] = helperShortID
+	}
 	return buf
 }
 
-// DecodePeerConn parses a PEER_CONN payload.
-func DecodePeerConn(payload []byte) (peerID, iamToken string, err error) {
+// DecodePeerConn parses a PEER_CONN payload. The trailing helperShortID byte
+// is optional; if missing it is reported as 0 (legacy single-helper mode).
+func DecodePeerConn(payload []byte) (peerID, iamToken string, helperShortID byte, err error) {
 	if len(payload) < 4 {
-		return "", "", errors.New("PEER_CONN payload too short")
+		return "", "", 0, errors.New("PEER_CONN payload too short")
 	}
 	off := 0
 	pLen := int(binary.BigEndian.Uint16(payload[off:]))
 	off += 2
 	if off+pLen+2 > len(payload) {
-		return "", "", errors.New("PEER_CONN: bad peerID length")
+		return "", "", 0, errors.New("PEER_CONN: bad peerID length")
 	}
 	peerID = string(payload[off : off+pLen])
 	off += pLen
@@ -163,10 +201,35 @@ func DecodePeerConn(payload []byte) (peerID, iamToken string, err error) {
 	tLen := int(binary.BigEndian.Uint16(payload[off:]))
 	off += 2
 	if off+tLen > len(payload) {
-		return "", "", errors.New("PEER_CONN: bad token length")
+		return "", "", 0, errors.New("PEER_CONN: bad token length")
 	}
 	iamToken = string(payload[off : off+tLen])
+	off += tLen
+
+	if off < len(payload) {
+		helperShortID = payload[off]
+	}
 	return
+}
+
+// EncodePeerGone builds a PEER_GONE payload. When helperShortID is nonzero it
+// indicates that only that specific helper disconnected (adapter-bound, multi-
+// helper mode). When zero, the payload is empty and means "the singleton peer
+// is gone" (legacy / helper-bound).
+func EncodePeerGone(helperShortID byte) []byte {
+	if helperShortID == 0 {
+		return nil
+	}
+	return []byte{helperShortID}
+}
+
+// DecodePeerGone returns the helperShortID from the payload, or 0 if the
+// payload is empty (legacy / helper-bound).
+func DecodePeerGone(payload []byte) byte {
+	if len(payload) == 0 {
+		return 0
+	}
+	return payload[0]
 }
 
 // EncodePong builds a PONG payload: [2B tokenLen][iamToken].

@@ -26,13 +26,25 @@ type Upstream struct {
 	conn        *websocket.Conn
 	running     bool
 	ownConnID   string
-	peerConnID  string
-	staleConnID string // last peer ID that failed wsSend
 	iamToken    string
+
+	// Helper-side state (single adapter peer).
+	peerConnID    string
+	staleConnID   string // last peer ID that failed wsSend
+	helperShortID byte   // own short ID assigned by cloud function (helper only; 0 on adapter)
+
+	// Adapter-side state (multiple helper peers).
+	helpers     map[byte]string // shortID -> helper connID
+	helperStale map[byte]string // shortID -> last failed connID (rejects stale PEER_CONN)
 }
 
 func New(cfg *config.Config, handler FrameHandler) *Upstream {
-	return &Upstream{cfg: cfg, handler: handler}
+	return &Upstream{
+		cfg:         cfg,
+		handler:     handler,
+		helpers:     make(map[byte]string),
+		helperStale: make(map[byte]string),
+	}
 }
 
 // OwnConnID returns this side's upstream connection ID.
@@ -120,6 +132,100 @@ func (u *Upstream) ClearStaleConnID() {
 	u.mu.Unlock()
 }
 
+// --- Adapter-side multi-helper API ---
+
+// HelperShortID returns this helper's assigned short ID (helper-side only).
+// Returns 0 on the adapter or when no ID has been assigned yet.
+func (u *Upstream) HelperShortID() byte {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.helperShortID
+}
+
+// SetHelperShortID stores this helper's assigned short ID (helper-side only).
+func (u *Upstream) SetHelperShortID(id byte) {
+	u.mu.Lock()
+	u.helperShortID = id
+	u.mu.Unlock()
+}
+
+// Helper returns a helper's connID by short ID (adapter-side). Empty if unknown.
+func (u *Upstream) Helper(shortID byte) string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.helpers[shortID]
+}
+
+// SetHelper records a helper's connID under its short ID (adapter-side).
+func (u *Upstream) SetHelper(shortID byte, connID string) {
+	u.mu.Lock()
+	u.helpers[shortID] = connID
+	// A fresh announcement clears any prior staleness for this slot.
+	delete(u.helperStale, shortID)
+	u.mu.Unlock()
+}
+
+// RemoveHelper drops a helper by short ID (adapter-side). Returns the removed
+// connID (or "" if there was no such helper).
+func (u *Upstream) RemoveHelper(shortID byte) string {
+	u.mu.Lock()
+	old := u.helpers[shortID]
+	delete(u.helpers, shortID)
+	delete(u.helperStale, shortID)
+	u.mu.Unlock()
+	return old
+}
+
+// Helpers returns a snapshot of all known helpers (adapter-side).
+func (u *Upstream) Helpers() map[byte]string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	out := make(map[byte]string, len(u.helpers))
+	for k, v := range u.helpers {
+		out[k] = v
+	}
+	return out
+}
+
+// HasHelpers reports whether at least one helper is connected (adapter-side).
+func (u *Upstream) HasHelpers() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return len(u.helpers) > 0
+}
+
+// MarkHelperStale removes a helper that has stopped responding to wsSend.
+// Returns the removed connID (or "" if none).
+func (u *Upstream) MarkHelperStale(shortID byte) string {
+	u.mu.Lock()
+	old := u.helpers[shortID]
+	delete(u.helpers, shortID)
+	if old != "" {
+		u.helperStale[shortID] = old
+	}
+	u.mu.Unlock()
+	if old != "" {
+		log.Printf("[WARN] helper shortID=%d connID=%s marked stale", shortID, old)
+	}
+	return old
+}
+
+// IsHelperStale checks whether the given (shortID, connID) pair matches the
+// most recent stale entry. Used to ignore PEER_CONN echoes carrying a broken ID.
+func (u *Upstream) IsHelperStale(shortID byte, connID string) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return connID != "" && u.helperStale[shortID] == connID
+}
+
+// HasAnyPeer reports whether the upstream has at least one known peer:
+// for a helper that's a non-empty peerConnID, for an adapter it's any helper.
+func (u *Upstream) HasAnyPeer() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.peerConnID != "" || len(u.helpers) > 0
+}
+
 func (u *Upstream) dial(ctx context.Context) (*websocket.Conn, error) {
 	log.Printf("[INFO] connecting to %s ...", u.cfg.Bridge.URL)
 	dialer := websocket.Dialer{
@@ -166,7 +272,7 @@ func (u *Upstream) dial(ctx context.Context) (*websocket.Conn, error) {
 		return nil, fmt.Errorf("unexpected response: 0x%02x", resp.Type)
 	}
 
-	ownID, peerID, iamToken, err := protocol.DecodeHelloOK(resp.Payload)
+	ownID, peerID, iamToken, helperShortID, err := protocol.DecodeHelloOK(resp.Payload)
 	if err != nil {
 		ws.Close()
 		return nil, fmt.Errorf("decode HELLO_OK: %w", err)
@@ -176,9 +282,14 @@ func (u *Upstream) dial(ctx context.Context) (*websocket.Conn, error) {
 	u.ownConnID = ownID
 	u.peerConnID = peerID
 	u.iamToken = iamToken
+	u.helperShortID = helperShortID // 0 on adapter, 1..255 on helper
 	u.mu.Unlock()
 
-	log.Printf("[INFO] upstream authenticated ownID=%s peerID=%s", ownID, peerID)
+	if helperShortID != 0 {
+		log.Printf("[INFO] upstream authenticated ownID=%s peerID=%s helperShortID=%d", ownID, peerID, helperShortID)
+	} else {
+		log.Printf("[INFO] upstream authenticated ownID=%s peerID=%s", ownID, peerID)
+	}
 
 	if tc, ok := ws.UnderlyingConn().(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
@@ -221,17 +332,18 @@ func (u *Upstream) pingLoop(ctx context.Context, interval time.Duration) {
 		case <-ticker.C:
 			u.mu.Lock()
 			c := u.conn
-			peer := u.peerConnID
+			hasPeer := u.peerConnID != "" || len(u.helpers) > 0
 			u.mu.Unlock()
 			if c == nil {
 				continue
 			}
-			// Only ping while a peer is known. Without a peer, we don't need
-			// IAM-token freshness (no wsSend target) and we don't need to
-			// keep the cloud function warm. The WS itself is allowed to idle
-			// out; if APIGW drops it, Run() will reconnect on demand and the
-			// function's HTTP poke on next helper CONNECT handles discovery.
-			if peer == "" {
+			// Only ping while at least one peer is known. Without a peer, we
+			// don't need IAM-token freshness (no wsSend target) and we don't
+			// need to keep the cloud function warm. The WS itself is allowed
+			// to idle out; if APIGW drops it, Run() will reconnect on demand
+			// and the function's HTTP poke on next helper CONNECT handles
+			// discovery.
+			if !hasPeer {
 				log.Printf("[DEBUG] ping skipped: no peer")
 				continue
 			}
@@ -334,6 +446,11 @@ func (u *Upstream) Run(ctx context.Context) {
 		u.ownConnID = ""
 		u.peerConnID = ""
 		u.iamToken = ""
+		u.helperShortID = 0
+		// Drop the adapter-side helper table on reconnect; the cloud function
+		// will re-announce surviving helpers via PEER_CONN on its next pass.
+		u.helpers = make(map[byte]string)
+		u.helperStale = make(map[byte]string)
 		u.mu.Unlock()
 
 		if ctx.Err() != nil {

@@ -29,6 +29,12 @@ public sealed class TunnelService : IDisposable
     private string _iamToken = "";
     private uint _nextStreamId;
 
+    // Short ID assigned by the cloud function to this helper (1..255). Stamped
+    // into the top byte of every streamID we allocate so the adapter can route
+    // per-stream frames back to us even when several helpers share the tunnel.
+    // 0 = unassigned / legacy single-helper deployment.
+    private byte _helperShortId;
+
     private readonly ConcurrentDictionary<uint, StreamState> _streams = new();
     private readonly ConcurrentDictionary<uint, TaskCompletionSource<byte[]>> _pendingOpens = new();
     private readonly ConcurrentDictionary<uint, uint> _streamSeqs = new();
@@ -112,6 +118,7 @@ public sealed class TunnelService : IDisposable
         }
         _cts = new CancellationTokenSource();
         _nextStreamId = 1;
+        _helperShortId = 0;
         _upstreamReady = false;
         var ct = _cts.Token;
 
@@ -191,14 +198,18 @@ public sealed class TunnelService : IDisposable
                     continue;
                 }
 
-                var (ownId, peerId, iamToken) = Protocol.DecodeHelloOK(payload);
+                var (ownId, peerId, iamToken, helperShortId) = Protocol.DecodeHelloOK(payload);
                 _ownConnId = ownId;
                 _peerConnId = peerId;
                 _iamToken = iamToken;
+                _helperShortId = helperShortId;
                 _staleConnId = "";
                 delay = 1000;
 
-                Log($"Authenticated. ownId={Shorten(ownId)} peerId={Shorten(peerId)}");
+                if (helperShortId != 0)
+                    Log($"Authenticated. ownId={Shorten(ownId)} peerId={Shorten(peerId)} shortId={helperShortId}");
+                else
+                    Log($"Authenticated. ownId={Shorten(ownId)} peerId={Shorten(peerId)}");
                 LogDns("Gateway", bridgeUri.Host, addresses);
                 if (!Relay)
                 {
@@ -255,6 +266,7 @@ public sealed class TunnelService : IDisposable
             _ownConnId = "";
             _peerConnId = "";
             _iamToken = "";
+            _helperShortId = 0;
             CloseAllStreams();
 
             if (ct.IsCancellationRequested) return;
@@ -572,9 +584,32 @@ public sealed class TunnelService : IDisposable
 
     private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
     {
-        var sid = Interlocked.Increment(ref _nextStreamId) - 1;
         var remote = client.Client.RemoteEndPoint?.ToString() ?? "?";
-        Log($"New connection remote={remote} stream={sid}");
+
+        // Wait until upstream is connected and (in direct mode) peer is known.
+        // We must wait BEFORE allocating the stream ID, because in multi-helper
+        // mode the cloud function assigns this helper a 1-byte shortId via
+        // HELLO_OK; we stamp it into the top byte of streamID so the adapter
+        // can route per-stream frames back to us. If we allocated before
+        // HELLO_OK, _helperShortId would still be 0 and the adapter wouldn't
+        // know whom to route the response to.
+        if (!await WaitForReadyAsync(ct))
+        {
+            Log($"Inbound TCP from {remote}: not ready (no upstream or peer), closing");
+            try { client.Close(); } catch { }
+            return;
+        }
+
+        // In multi-helper mode the cloud function assigns this helper a 1-byte
+        // shortId via HELLO_OK; we stamp it into the top byte of streamID so
+        // the adapter can route per-stream frames back to us. shortId==0
+        // means single-helper / legacy deployment.
+        var local = (Interlocked.Increment(ref _nextStreamId) - 1) & 0x00FFFFFFu;
+        var sid = ((uint)_helperShortId << 24) | local;
+        if (_helperShortId != 0)
+            Log($"New connection remote={remote} stream={sid} (shortId={_helperShortId} local={local})");
+        else
+            Log($"New connection remote={remote} stream={sid}");
 
         var state = new StreamState(sid, client);
 
@@ -607,14 +642,8 @@ public sealed class TunnelService : IDisposable
 
         try
         {
-            // Wait until upstream is connected and peer is known (up to 10s).
-            if (!await WaitForReadyAsync(ct))
-            {
-                Log($"OPEN failed stream={sid}: not ready (no upstream or peer)");
-                _pendingOpens.TryRemove(sid, out _);
-                CloseStream(state);
-                return;
-            }
+            // (Readiness was already verified before stream-ID allocation;
+            // no need to re-check here.)
 
             // Send OPEN.
             var err = await SendToPeerAsync(Protocol.Encode(Protocol.MsgOpen, sid, NextSeq(sid)));

@@ -40,16 +40,29 @@ func main() {
 	wsClient := wsapi.NewClient()
 
 	var ups *upstream.Upstream
+	var sm *streams.Manager
 
-	sm := streams.NewManager(func(data []byte) error {
-		peerID := ups.PeerConnID()
+	sm = streams.NewManager(func(data []byte) error {
+		// Frame on the wire is [1B type][4B streamID BE][4B seqID BE][payload].
+		// The top byte of streamID is the helper short ID assigned by the cloud
+		// function; we use it to route per-stream frames back to the originating
+		// helper without having to decode the whole frame.
+		var shortID byte
+		if len(data) >= 2 {
+			shortID = data[1]
+		}
+		peerID := ups.Helper(shortID)
 		token := ups.IAMToken()
 		if peerID == "" || token == "" {
-			return fmt.Errorf("no peer connected")
+			return fmt.Errorf("no helper for shortID=%d", shortID)
 		}
 		err := wsClient.Send(peerID, data, "BINARY", token)
 		if err != nil {
-			ups.MarkPeerStale()
+			// Drop just this helper; other helpers keep working.
+			ups.MarkHelperStale(shortID)
+			// Close that helper's streams so we don't keep buffering forever.
+			n := sm.CloseHelper(shortID)
+			log.Printf("[WARN] helper shortID=%d wsSend failed, closed %d streams: %v", shortID, n, err)
 		}
 		return err
 	})
@@ -60,25 +73,41 @@ func main() {
 		switch f.Type {
 		// --- Control ---
 		case protocol.MsgPeerConn:
-			peerID, iamToken, err := protocol.DecodePeerConn(f.Payload)
+			peerID, iamToken, helperShortID, err := protocol.DecodePeerConn(f.Payload)
 			if err != nil {
 				log.Printf("[WARN] bad PEER_CONN: %v", err)
 				return
 			}
-			if ups.IsStaleConnID(peerID) {
-				log.Printf("[WARN] PEER_CONN with stale ID %s, ignoring (waiting for fresh ID)", peerID)
+			if helperShortID == 0 {
+				// Legacy / cloud function without multi-helper support. Treat
+				// as helper shortID=1 so a single helper still works.
+				helperShortID = 1
+			}
+			if ups.IsHelperStale(helperShortID, peerID) {
+				log.Printf("[WARN] PEER_CONN with stale ID shortID=%d peerID=%s, ignoring", helperShortID, peerID)
 				return
 			}
-			ups.ClearStaleConnID()
-			log.Printf("[INFO] PEER_CONN received: peerID=%s tokenLen=%d", peerID, len(iamToken))
-			ups.SetPeerConnID(peerID)
+			log.Printf("[INFO] PEER_CONN received: shortID=%d peerID=%s tokenLen=%d", helperShortID, peerID, len(iamToken))
+			ups.SetHelper(helperShortID, peerID)
 			if iamToken != "" {
 				ups.SetIAMToken(iamToken)
 			}
 		case protocol.MsgPeerGone:
-			log.Printf("[INFO] PEER_GONE received, closing %d streams", sm.Count())
-			ups.SetPeerConnID("")
-			sm.CloseAll()
+			shortID := protocol.DecodePeerGone(f.Payload)
+			if shortID == 0 {
+				// Legacy / all-peers-gone (e.g. cloud function couldn't tell us
+				// which). Close everything.
+				log.Printf("[INFO] PEER_GONE (all) received, closing %d streams", sm.Count())
+				// Clear every helper slot.
+				for sid := range ups.Helpers() {
+					ups.RemoveHelper(sid)
+				}
+				sm.CloseAll()
+			} else {
+				old := ups.RemoveHelper(shortID)
+				n := sm.CloseHelper(shortID)
+				log.Printf("[INFO] PEER_GONE received: shortID=%d peerID=%s closed=%d streams", shortID, old, n)
+			}
 		case protocol.MsgPong:
 			iamToken, err := protocol.DecodePong(f.Payload)
 			if err != nil {
@@ -151,15 +180,28 @@ func main() {
 			}
 			own := ups.OwnConnID()
 			peer := ups.PeerConnID()
+			helpers := ups.Helpers()
 			if own == "" {
 				log.Printf("[INFO] /conn-ids requested from %s but adapter not connected yet", r.RemoteAddr)
 				w.WriteHeader(http.StatusServiceUnavailable)
 				return
 			}
-			log.Printf("[INFO] /conn-ids requested from %s adapterConnId=%s helperConnId=%s", r.RemoteAddr, own, peer)
-			resp := map[string]string{
+			log.Printf("[INFO] /conn-ids requested from %s adapterConnId=%s helpers=%d", r.RemoteAddr, own, len(helpers))
+			// helpers field is the multi-helper map (preferred by the cloud
+			// function on cold-start recovery). helperConnId is preserved for
+			// compatibility with older cloud-function deployments that only
+			// understand a single helper.
+			helperList := make([]map[string]any, 0, len(helpers))
+			for sid, cid := range helpers {
+				helperList = append(helperList, map[string]any{
+					"shortId": sid,
+					"connId":  cid,
+				})
+			}
+			resp := map[string]any{
 				"adapterConnId": own,
-				"helperConnId":  peer,
+				"helperConnId":  peer, // legacy single-helper compat
+				"helpers":       helperList,
 			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(resp)

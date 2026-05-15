@@ -83,7 +83,7 @@ func main() {
 		switch f.Type {
 		// --- Control ---
 		case protocol.MsgPeerConn:
-			peerID, iamToken, err := protocol.DecodePeerConn(f.Payload)
+			peerID, iamToken, _, err := protocol.DecodePeerConn(f.Payload)
 			if err != nil {
 				log.Printf("[WARN] bad PEER_CONN: %v", err)
 				return
@@ -191,17 +191,23 @@ func handleConn(ctx context.Context, conn net.Conn, ups *upstream.Upstream, sm *
 		tc.SetNoDelay(true)
 	}
 
-	sid := sm.NextID()
-	log.Printf("[INFO] new TCP connection remote=%s stream=%d", conn.RemoteAddr(), sid)
-
-	s := &streams.Stream{ID: sid, Conn: conn}
-
-	// Wait for peer readiness before sending OPEN
+	// Wait for peer readiness before allocating a stream ID. We must wait
+	// because the helperShortID (top byte of every stream ID we generate) is
+	// assigned by the cloud function and arrives in HELLO_OK; if we allocate
+	// before HELLO_OK we'd use shortID=0 and the adapter wouldn't know whom
+	// to route the response to.
 	if !waitForPeer(ctx, ups, relay, 10*time.Second) {
-		log.Printf("[WARN] no peer available stream=%d, closing", sid)
+		log.Printf("[WARN] no peer available, closing inbound TCP from %s", conn.RemoteAddr())
 		conn.Close()
 		return
 	}
+
+	shortID := ups.HelperShortID()
+	localID := sm.NextID() & 0x00FFFFFF // 24-bit local ID
+	sid := (uint32(shortID) << 24) | localID
+	log.Printf("[INFO] new TCP connection remote=%s stream=%d (shortID=%d local=%d)", conn.RemoteAddr(), sid, shortID, localID)
+
+	s := &streams.Stream{ID: sid, Conn: conn}
 
 	// Register pending open
 	ch := make(chan protocol.Frame, 1)
@@ -253,19 +259,34 @@ func handleConn(ctx context.Context, conn net.Conn, ups *upstream.Upstream, sm *
 	sm.ReadLoop(s)
 }
 
-// waitForPeer blocks until the peer is available (or relay mode), sending a
-// SYNC to speed up discovery. Returns false on timeout or cancellation.
+// waitForPeer blocks until the peer is available (or relay mode is ready),
+// sending a SYNC to speed up discovery. Returns false on timeout or
+// cancellation.
+//
+// Even in relay mode we must wait for HELLO_OK to complete (signalled by a
+// non-empty OwnConnID), because the helperShortID assigned to us by the cloud
+// function is delivered in HELLO_OK and we stamp it into the top byte of
+// every streamID we allocate. Allocating before HELLO_OK would yield
+// shortID=0 and the adapter wouldn't be able to route response frames.
 func waitForPeer(ctx context.Context, ups *upstream.Upstream, relay bool, timeout time.Duration) bool {
-	if relay {
-		return true
+	ready := func() bool {
+		if relay {
+			return ups.OwnConnID() != ""
+		}
+		return ups.PeerConnID() != ""
 	}
-	if ups.PeerConnID() != "" {
+	if ready() {
 		return true
 	}
 
-	// Send SYNC to ask the cloud function for the current adapter ID
-	log.Printf("[DEBUG] peer unknown, sending SYNC for discovery")
-	ups.SendSync()
+	// Send SYNC to ask the cloud function for the current adapter ID (no-op
+	// in relay mode where we just need HELLO_OK, but harmless).
+	if !relay {
+		log.Printf("[DEBUG] peer unknown, sending SYNC for discovery")
+		ups.SendSync()
+	} else {
+		log.Printf("[DEBUG] upstream not yet authenticated (relay), waiting for HELLO_OK")
+	}
 
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
@@ -284,12 +305,12 @@ func waitForPeer(ctx context.Context, ups *upstream.Upstream, relay bool, timeou
 		case <-deadline.C:
 			return false
 		case <-syncTicker.C:
-			if ups.PeerConnID() == "" {
+			if !relay && ups.PeerConnID() == "" {
 				log.Printf("[DEBUG] re-sending SYNC for discovery")
 				ups.SendSync()
 			}
 		case <-pollTicker.C:
-			if ups.PeerConnID() != "" {
+			if ready() {
 				return true
 			}
 		}

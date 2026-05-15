@@ -9,7 +9,10 @@ See [README_RU.md](README_RU.md) for documentation in Russian.
 ## What's new — 2026-05-15
 
 This release is heavily optimised. The helper now reorders out-of-order frames on receive, pre-registers streams before sending `OPEN` (so the first DATA packets after `OPEN_OK` are never dropped), uses an async per-stream write queue so a slow local consumer no longer stalls every other stream, and does a graceful half-close on `FIN` so HTTP responses are no longer truncated. In practice: connections are established noticeably faster and the tunnel is significantly more stable, especially on mobile.
+Also, multiple clients (helpers) can now connect to the same adapter/function simultaneously without interfering with each other. The previous "one adapter — one function — one client" limitation no longer applies.
 
+
+## Versions
 
 The tunnel comes in four variants:
 
@@ -50,6 +53,14 @@ Client ◄──TCP── Helper ◄──WS────────── API G
 
 > This is a proof-of-concept and a messy hobby project. No guarantees of any kind. The wire protocol, configuration format and APIs can change at any time - sometimes every day. Whenever you pull a new revision, ALWAYS update all three components together: Cloud Function (`bridge-cloud/`), adapter, and helper / MAUI app. Mixing versions across these components will almost certainly break the tunnel in subtle and frustrating ways.
 
+## Installation overview
+
+Three pieces need to be in place. Detailed configuration for each lives in its own section below; here is the high-level order:
+
+1. **Adapter** — build it (see [Adapter / Build](#build)) and run it on a remote server, ideally next to whatever you ultimately proxy through (Dante / XRay-core / etc.). It must expose its `/conn-ids` HTTP port to the public internet so the Serverless Function can reach it on cold start.
+2. **Cloud Function** — deploy [`bridge-cloud/`](bridge-cloud/) to Yandex Cloud Functions and bind it to an API Gateway. Set the `ADAPTER_CONN_IDS_URL` env var to your adapter's `https://<server>:<port>/conn-ids`, and use the same `AUTH_TOKEN` shared secret on all three components. Don't forget to obfuscate the JS before uploading (see notice above).
+3. **Client** — configure the Go helper or the MAUI app with the same `bridge.url` (the API Gateway URL ending in `/_helper`) and `authToken`. Start it, point your apps at the helper's local listen port, and you're done.
+
 ## How it works
 
 1. **Adapter** makes an outbound connection to the API Gateway at path `/_adapter` and authenticates with the Serverless Function (HELLO handshake). It receives its connection ID.
@@ -68,9 +79,6 @@ In relay mode, frames belonging to the same stream may arrive out of order. The 
 ### Write coalescing
 
 The `writeCoalescing` option implements an algorithm similar to TCP Nagle: small TCP reads are buffered and merged into a single DATA frame. This significantly reduces the number of `wsSend` / relay messages, which improves throughput and reduces load on YC. Data is sent either after `delayMs` elapses, or when the buffer reaches 32 KB — whichever comes first. With the Go helper, it is recommended to always enable this on the adapter side when using relay mode; without relay it is optional on both sides (try it — it may be better with or without). In the MAUI app it is buggy.
-
-**Important**: one adapter — one function — one client!
-Multiple clients to the same function/adapter result in undefined behavior (everything breaks). To support multiple clients you'd need to slightly redesign the protocol and implementation, but I can't be bothered.
 
 ### Relay mode
 

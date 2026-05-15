@@ -79,13 +79,18 @@ public static class Protocol
         return buf;
     }
 
-    public static (string OwnId, string PeerId, string IamToken) DecodeHelloOK(byte[] payload)
+    public static (string OwnId, string PeerId, string IamToken, byte HelperShortId) DecodeHelloOK(byte[] payload)
     {
         int off = 0;
         var ownId = ReadLenPrefixed(payload, ref off);
         var peerId = ReadLenPrefixed(payload, ref off);
         var iamToken = ReadLenPrefixed(payload, ref off);
-        return (ownId, peerId, iamToken);
+        // Optional trailing 1-byte helperShortId (multi-helper mode). When the
+        // cloud function assigns this helper a unique 1..255 ID, it appends
+        // it here; the helper stamps it into the top byte of every streamID
+        // it allocates so the adapter can route per-stream frames back to us.
+        byte helperShortId = (byte)(off < payload.Length ? payload[off] : 0);
+        return (ownId, peerId, iamToken, helperShortId);
     }
 
     public static (string PeerId, string IamToken) DecodePeerConn(byte[] payload)
@@ -93,6 +98,8 @@ public static class Protocol
         int off = 0;
         var peerId = ReadLenPrefixed(payload, ref off);
         var iamToken = ReadLenPrefixed(payload, ref off);
+        // Optional trailing helperShortId byte in this payload is only used in
+        // the cloud-function -> adapter direction; helpers can safely ignore.
         return (peerId, iamToken);
     }
 

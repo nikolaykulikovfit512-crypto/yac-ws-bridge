@@ -186,6 +186,42 @@ func (m *Manager) CloseAll() {
 	}
 }
 
+// CloseHelper closes every stream whose top byte of stream ID matches the
+// given helper short ID. Used on the adapter side when a single helper goes
+// away (PEER_GONE for that helper, or wsSend persistently fails) without
+// disturbing streams belonging to other helpers. Returns the number of
+// streams closed.
+func (m *Manager) CloseHelper(shortID byte) int {
+	if shortID == 0 {
+		return 0
+	}
+	m.mu.Lock()
+	victims := make([]*Stream, 0)
+	for id, s := range m.streams {
+		if byte(id>>24) == shortID {
+			victims = append(victims, s)
+		}
+	}
+	m.mu.Unlock()
+
+	for _, s := range victims {
+		m.CloseStream(s)
+	}
+
+	// Clear reorder buffers for this helper.
+	if m.Reorder {
+		m.reorderMu.Lock()
+		for id := range m.reorderBufs {
+			if byte(id>>24) == shortID {
+				delete(m.reorderBufs, id)
+			}
+		}
+		m.reorderMu.Unlock()
+	}
+	// Seq counters get cleaned up by Remove() inside CloseStream.
+	return len(victims)
+}
+
 // HandleStreamFrame processes an incoming stream frame with optional reordering.
 // When Reorder is true, frames are buffered and delivered in SeqID order.
 // The handler callback is invoked for each frame in sequence order and may be

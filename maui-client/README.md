@@ -6,6 +6,8 @@ Cross-platform GUI client for the Bridge to Freedom TCP tunnel. Acts as the **he
 
 This release is heavily optimised. The helper now reorders out-of-order frames on receive, pre-registers streams before sending `OPEN` (so DATA packets that arrive immediately after `OPEN_OK` are never dropped), uses an async per-stream write queue so a slow local consumer no longer stalls every other stream, and does a graceful half-close on `FIN` so HTTP responses are no longer truncated. In practice: connections come up noticeably faster and the tunnel is significantly more stable, especially on mobile.
 
+Also, multiple clients (helpers) can now connect to the same adapter/function simultaneously without interfering with each other. The previous "one adapter — one function — one client" limitation no longer applies.
+
 ## Supported platforms
 
 - **Android** (API 26+ / Android 8.0+)
