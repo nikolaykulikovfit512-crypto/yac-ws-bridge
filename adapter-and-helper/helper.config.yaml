@@ -7,7 +7,11 @@ bridge:
     initialDelayMs: 1000
     maxDelayMs: 30000
     backoffMultiplier: 2.0
-  pingIntervalMs: 30000
+  # Periodic PING to refresh IAM token (PONG carries it) and keep the upstream
+  # WS alive against API Gateway idle timeout. Pings are gated on a known peer
+  # (skipped when no adapter is known), so a helper waiting for an adapter
+  # stays cheap.
+  pingIntervalMs: 240000
 
 # Local address helper listens on for incoming TCP connections.
 listen:

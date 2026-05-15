@@ -1,4 +1,4 @@
-﻿// Bridge to Freedom v4 — Yandex Cloud Function
+// Bridge to Freedom v4 — Yandex Cloud Function
 // Discovery service: exchanges connection IDs between adapter and helper.
 // Optionally relays helper's stream frames to the adapter (relay mode).
 //
@@ -62,13 +62,18 @@ function httpGet(url, headers) {
 }
 
 // Fetch connection IDs from adapter on cold start (with retries).
-async function fetchConnIds() {
+// If iamToken is provided, also pass it to the adapter as X-IAM-Token so the
+// adapter can refresh its cached IAM token without needing a PING/PONG round
+// trip. The init-time call (no handler context yet) skips this header.
+async function fetchConnIds(iamToken) {
   if (!ADAPTER_URL) return;
   const url = ADAPTER_URL.replace(/\/+$/, '') + '/conn-ids';
+  const headers = { 'Authorization': 'Bearer ' + AUTH_TOKEN };
+  if (iamToken) headers['X-IAM-Token'] = iamToken;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      console.log(`fetchConnIds attempt=${attempt} url=${url}`);
-      const r = await httpGet(url, { 'Authorization': 'Bearer ' + AUTH_TOKEN });
+      console.log(`fetchConnIds attempt=${attempt} url=${url} iamTokenLen=${(iamToken || '').length}`);
+      const r = await httpGet(url, headers);
       if (r.status === 200 && r.body) {
         const data = JSON.parse(r.body);
         if (data.adapterConnId) adapterConnId = data.adapterConnId;
@@ -90,14 +95,15 @@ _initPromise = fetchConnIds();
 
 // Try to learn the missing peer's connId via the adapter HTTP endpoint.
 // Skips if called within the last 2 seconds to avoid hammering.
-async function ensurePeerKnown(which) {
+// Passes the current IAM token along so the adapter can refresh its cached one.
+async function ensurePeerKnown(which, iamToken) {
   const now = Date.now();
   if (now - _lastFetchMs < 2000) return;
   if (which === 'adapter' && adapterConnId) return;
   if (which === 'helper' && helperConnId) return;
   console.log(`ensurePeerKnown: ${which} unknown, calling fetchConnIds`);
   _lastFetchMs = now;
-  await fetchConnIds();
+  await fetchConnIds(iamToken);
 }
 
 // WS management API — send binary data to a connection.
@@ -232,7 +238,7 @@ async function handle(event, context) {
           console.error(`adapter HELLO auth failed ver=${ver} tokenMatch=${tok === AUTH_TOKEN}`);
           return binaryResp(encodeControl(MSG_HELLO_ERR, Buffer.from('auth failed')));
         }
-        if (!helperConnId) await ensurePeerKnown('helper');
+        if (!helperConnId) await ensurePeerKnown('helper', token);
         if (helperConnId) {
           console.log(`adapter HELLO: notifying helper ${helperConnId} of adapter connId`);
           const st = await wsSend(helperConnId, encodeControl(MSG_PEER_CONN, encodePeerConn(adapterConnId, token)), token);
@@ -250,7 +256,7 @@ async function handle(event, context) {
           console.log(`adapter PING: re-learned adapterConnId=${connId} (was ${adapterConnId || 'null'})`);
           adapterConnId = connId;
         }
-        if (!helperConnId) await ensurePeerKnown('helper');
+        if (!helperConnId) await ensurePeerKnown('helper', token);
         // If we now know both sides, notify helper of adapter (covers cross-instance state loss)
         if (helperConnId) {
           console.log(`adapter PING: cross-notifying helper ${helperConnId} of adapter connId`);
@@ -264,7 +270,7 @@ async function handle(event, context) {
         return binaryResp(encodeControl(MSG_PONG, encodePong(token)));
       }
       if (type === MSG_SYNC) {
-        if (!helperConnId) await ensurePeerKnown('helper');
+        if (!helperConnId) await ensurePeerKnown('helper', token);
         if (helperConnId) {
           console.log(`adapter SYNC -> PEER_CONN helperConnId=${helperConnId}`);
           return binaryResp(encodeControl(MSG_PEER_CONN, encodePeerConn(helperConnId, token)));
@@ -308,7 +314,7 @@ async function handle(event, context) {
 
       // Stream frames (type >= 0x10): relay to adapter
       if (type >= 0x10) {
-        if (!adapterConnId) await ensurePeerKnown('adapter');
+        if (!adapterConnId) await ensurePeerKnown('adapter', token);
         if (adapterConnId) {
           console.log(`relay ${msgName(type)} streamId=${streamId} seq=${seqId} -> adapter ${adapterConnId} bytes=${buf.length}`);
           const st = await wsSend(adapterConnId, buf, token);
@@ -338,7 +344,7 @@ async function handle(event, context) {
           console.error(`helper HELLO auth failed ver=${ver} tokenMatch=${tok === AUTH_TOKEN}`);
           return binaryResp(encodeControl(MSG_HELLO_ERR, Buffer.from('auth failed')));
         }
-        if (!adapterConnId) await ensurePeerKnown('adapter');
+        if (!adapterConnId) await ensurePeerKnown('adapter', token);
         if (adapterConnId) {
           console.log(`helper HELLO: notifying adapter ${adapterConnId} of helper connId`);
           const st = await wsSend(adapterConnId, encodeControl(MSG_PEER_CONN, encodePeerConn(helperConnId, token)), token);
@@ -356,7 +362,7 @@ async function handle(event, context) {
           console.log(`helper PING: re-learned helperConnId=${connId} (was ${helperConnId || 'null'})`);
           helperConnId = connId;
         }
-        if (!adapterConnId) await ensurePeerKnown('adapter');
+        if (!adapterConnId) await ensurePeerKnown('adapter', token);
         // If we now know both sides, notify adapter of helper (covers cross-instance state loss)
         if (adapterConnId) {
           console.log(`helper PING: cross-notifying adapter ${adapterConnId} of helper connId`);
@@ -370,7 +376,7 @@ async function handle(event, context) {
         return binaryResp(encodeControl(MSG_PONG, encodePong(token)));
       }
       if (type === MSG_SYNC) {
-        if (!adapterConnId) await ensurePeerKnown('adapter');
+        if (!adapterConnId) await ensurePeerKnown('adapter', token);
         if (adapterConnId) {
           console.log(`helper SYNC -> PEER_CONN adapterConnId=${adapterConnId}`);
           return binaryResp(encodeControl(MSG_PEER_CONN, encodePeerConn(adapterConnId, token)));

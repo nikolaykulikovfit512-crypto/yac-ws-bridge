@@ -221,13 +221,25 @@ func (u *Upstream) pingLoop(ctx context.Context, interval time.Duration) {
 		case <-ticker.C:
 			u.mu.Lock()
 			c := u.conn
+			peer := u.peerConnID
 			u.mu.Unlock()
-			if c != nil {
-				log.Printf("[DEBUG] sending PING")
-				f := protocol.Encode(protocol.Frame{Type: protocol.MsgPing})
-				u.writeMu.Lock()
-				c.WriteMessage(websocket.BinaryMessage, f)
-				u.writeMu.Unlock()
+			if c == nil {
+				continue
+			}
+			// Only ping while a peer is known. Without a peer, we don't need
+			// IAM-token freshness (no wsSend target) and we don't need to
+			// keep the cloud function warm. The WS itself is allowed to idle
+			// out; if APIGW drops it, Run() will reconnect on demand and the
+			// function's HTTP poke on next helper CONNECT handles discovery.
+			if peer == "" {
+				log.Printf("[DEBUG] ping skipped: no peer")
+				continue
+			}
+			log.Printf("[DEBUG] sending PING")
+			f := protocol.Encode(protocol.Frame{Type: protocol.MsgPing})
+			u.writeMu.Lock()
+			c.WriteMessage(websocket.BinaryMessage, f)
+			u.writeMu.Unlock()
 			}
 		}
 	}

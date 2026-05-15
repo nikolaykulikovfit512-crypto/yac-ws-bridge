@@ -7,7 +7,12 @@ bridge:
     initialDelayMs: 1000
     maxDelayMs: 30000
     backoffMultiplier: 2.0
-  pingIntervalMs: 30000
+  # Periodic PING to refresh IAM token (PONG carries it) and keep the upstream WS
+  # alive against API Gateway idle timeout. Pings are gated on a known peer
+  # (skipped when no helper is connected), so an idle adapter stays cheap and
+  # lets the cloud function go cold; the function's HTTP /conn-ids poke wakes
+  # everything up on the next helper connect.
+  pingIntervalMs: 240000
 
 # Local service the adapter connects to for each incoming stream.
 target:

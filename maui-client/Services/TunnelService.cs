@@ -38,7 +38,10 @@ public sealed class TunnelService : IDisposable
     public string ListenAddress { get; set; } = "0.0.0.0";
     public int ListenPort { get; set; } = 5080;
     public bool Relay { get; set; }
-    public int PingIntervalMs { get; set; } = 30000;
+    // Periodic PING to refresh IAM token (PONG carries it) and keep the upstream
+    // WS alive against APIGW idle timeout. Gated on a known peer in PingLoopAsync,
+    // so an idle tunnel waiting for an adapter doesn't spam the cloud function.
+    public int PingIntervalMs { get; set; } = 240000;
     public bool WriteCoalescing { get; set; }
     public int WriteCoalescingDelayMs { get; set; } = 10;
 
@@ -703,6 +706,12 @@ public sealed class TunnelService : IDisposable
             while (!ct.IsCancellationRequested && _upstream?.State == WebSocketState.Open)
             {
                 await Task.Delay(PingIntervalMs, ct);
+                // Only ping while a peer is known (direct mode) or in relay mode
+                // where we always need the WS alive for our own data path.
+                // Without a peer in direct mode we don't need IAM-token refresh
+                // and we don't need to keep the cloud function warm; the WS may
+                // idle out and reconnect on demand.
+                if (!Relay && string.IsNullOrEmpty(_peerConnId)) continue;
                 await WsSendUpstream(Protocol.Encode(Protocol.MsgPing, 0), ct);
             }
         }

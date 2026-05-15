@@ -142,6 +142,13 @@ func main() {
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
+			// Cloud function may piggyback its current YC IAM token here so we
+			// can refresh ours without a PING/PONG round trip. Allows us to keep
+			// the periodic PING loop low-frequency / peer-gated.
+			if iamToken := r.Header.Get("X-IAM-Token"); iamToken != "" {
+				ups.SetIAMToken(iamToken)
+				log.Printf("[INFO] /conn-ids refreshed IAM token from %s tokenLen=%d", r.RemoteAddr, len(iamToken))
+			}
 			own := ups.OwnConnID()
 			peer := ups.PeerConnID()
 			if own == "" {
