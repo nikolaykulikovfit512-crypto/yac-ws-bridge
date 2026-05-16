@@ -30,6 +30,13 @@
     <WindowsPackageType Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">None</WindowsPackageType>
   </PropertyGroup>
 
+  <!-- Windows: ship an app.manifest so the unpackaged app declares
+       PerMonitorV2 DPI awareness. Without this, text is blurry on
+       high-DPI / non-100% scaling displays. -->
+  <PropertyGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">
+    <ApplicationManifest>Platforms\Windows\app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
   <PropertyGroup Condition="'$(Configuration)|$(TargetFramework)|$(Platform)'=='Debug|net10.0-android|AnyCPU'">
     <UseMonoRuntime>true</UseMonoRuntime>
   </PropertyGroup>
