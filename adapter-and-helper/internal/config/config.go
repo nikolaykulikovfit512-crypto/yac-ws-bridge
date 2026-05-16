@@ -22,7 +22,8 @@ type Config struct {
 		Address string `yaml:"address"`
 	} `yaml:"target"`
 	HTTP struct {
-		ListenPort int `yaml:"listenPort"`
+		ListenPort int    `yaml:"listenPort"`
+		Path       string `yaml:"path"`
 	} `yaml:"http"`
 	Listen struct {
 		Address string `yaml:"address"`

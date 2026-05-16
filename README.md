@@ -11,6 +11,9 @@ See [README_RU.md](README_RU.md) for documentation in Russian.
 This release is heavily optimised. The helper now reorders out-of-order frames on receive, pre-registers streams before sending `OPEN` (so the first DATA packets after `OPEN_OK` are never dropped), uses an async per-stream write queue so a slow local consumer no longer stalls every other stream, and does a graceful half-close on `FIN` so HTTP responses are no longer truncated. In practice: connections are established noticeably faster and the tunnel is significantly more stable, especially on mobile.
 Also, multiple clients (helpers) can now connect to the same adapter/function simultaneously without interfering with each other. The previous "one adapter — one function — one client" limitation no longer applies.
 
+## What's new — 2026-05-16
+
+The adapter's HTTP endpoint path is now configurable via the new `http.path` setting in `adapter.config.yaml` (default `/conn-ids`), so you can rename it to something non-fingerprintable without editing source code. Correspondingly, the cloud function env var `ADAPTER_URL` has been renamed to `HTTP_URL` and its format has changed: it now expects the **full** URL of the adapter's endpoint (including the path), e.g. `https://your-server:8080/conn-ids`, instead of just the HTTP base. If you upgrade an existing deployment, update both the adapter config and the function's env variable. See [Customizing endpoint paths](#customizing-endpoint-paths) for details.
 
 ## Versions
 
@@ -22,7 +25,7 @@ The tunnel comes in four variants:
 
 3. Experimental variant (branch `experimental`), similar to variant 2 but instead of a custom multiplexing/error-correction algorithm it uses QUIC wrapped in WebSocket messages.
 
-4. Experimental IP-tunnel variant (branch `ip-tun`): instead of proxying TCP streams, the MAUI client opens a TUN device on Android and tunnels raw IP packets to the adapter. **Android-only** (uses `VpnService`) but supports **per-app tunneling**, so you can route only the apps you want. Speeds are roughly on par with a 2G mobile connection — bad for web browsing, but acceptable for Telegram. See README/README_RU on the `ip-tun` branch for details.
+4. Experimental IP-tunnel variant (branch `ip-tun`): instead of proxying TCP streams, the MAUI client opens a TUN device on Android and tunnels raw IP packets to the adapter (**Android-only**). Speeds are roughly on par with a 2G mobile connection — bad for web browsing, but acceptable for Telegram. See README/README_RU on the `ip-tun` branch for details.
 
 In the adapter + helper variant:
 
@@ -57,8 +60,8 @@ Client ◄──TCP── Helper ◄──WS────────── API G
 
 Three pieces need to be in place. Detailed configuration for each lives in its own section below; here is the high-level order:
 
-1. **Adapter** — build it (see [Adapter / Build](#build)) and run it on a remote server, ideally next to whatever you ultimately proxy through (Dante / XRay-core / etc.). It must expose its `/conn-ids` HTTP port to the public internet so the Serverless Function can reach it on cold start.
-2. **Cloud Function** — deploy [`bridge-cloud/`](bridge-cloud/) to Yandex Cloud Functions and bind it to an API Gateway. Set the `ADAPTER_URL` env var to your adapter's HTTP base (e.g. `https://<server>:<port>` — the function appends the `/conn-ids` path itself), and use the same `AUTH_TOKEN` shared secret on all three components. Don't forget to obfuscate the JS before uploading (see notice above).
+1. **Adapter** — build it (see [Adapter / Build](#build)) and run it on a remote server, ideally next to whatever you ultimately proxy through (Dante / XRay-core / etc.). It must expose its HTTP recovery endpoint to the public internet so the Serverless Function can reach it on cold start (default path `/conn-ids`, configurable via `http.path` — see [Customizing endpoint paths](#customizing-endpoint-paths)).
+2. **Cloud Function** — deploy [`bridge-cloud/`](bridge-cloud/) to Yandex Cloud Functions and bind it to an API Gateway. Set the `HTTP_URL` env var to the **full** URL of the adapter's HTTP recovery endpoint (e.g. `https://<server>:<port>/conn-ids`, or whatever path you set in the adapter's `http.path`), and use the same `AUTH_TOKEN` shared secret on all three components. Don't forget to obfuscate the JS before uploading (see notice above).
 3. **Client** — configure the Go helper or the MAUI app with the same `bridge.url` (the API Gateway URL ending in `/_helper`) and `authToken`. Start it, point your apps at the helper's local listen port, and you're done.
 
 ## How it works
@@ -124,14 +127,14 @@ To avoid a recognisable URL structure, you can rename all of the default endpoin
 3. Update `bridge.url` in [`helper.config.yaml`](adapter-and-helper/helper.config.yaml) (or the **Bridge URL** field in the MAUI app) to use the new helper path.
 4. Redeploy the API Gateway with the updated spec.
 
-**HTTP path `/conn-ids` — currently hardcoded in two source files.**
+**HTTP path on the adapter (default `/conn-ids`) — configurable via `http.path`.**
 
-The adapter's HTTP endpoint that the Cloud Function polls on cold start is `/conn-ids`. To rename it, change both:
+The adapter's HTTP endpoint that the Cloud Function polls on cold start defaults to `/conn-ids`. To rename it:
 
-- [`adapter-and-helper/cmd/adapter/main.go`](adapter-and-helper/cmd/adapter/main.go) — the `mux.HandleFunc("/conn-ids", ...)` line.
-- [`bridge-cloud/index.js`](bridge-cloud/index.js) — the line that builds the URL: `ADAPTER_URL.replace(/\/+$/, '') + '/conn-ids'`.
+1. Set `http.path` in [`adapter.config.yaml`](adapter-and-helper/adapter.config.yaml) to your random path, e.g. `/p4f9z2`. Restart the adapter.
+2. Set the Cloud Function's `HTTP_URL` env var to the **full** URL including the new path, e.g. `https://your-server:3001/p4f9z2`. Redeploy the function (or update the env var on the existing version).
 
-Then rebuild the adapter and redeploy the function. Log strings mentioning `/conn-ids` can stay as-is — they are not visible externally.
+No source edits are needed — both ends are config-driven.
 
 ---
 
@@ -167,6 +170,7 @@ target:
 
 http:
   listenPort: 3001
+  path: "/conn-ids"
 
 writeCoalescing:
   enabled: true
@@ -186,7 +190,8 @@ logging:
 | `bridge.reconnect` | Exponential backoff for upstream reconnects |
 | `bridge.pingIntervalMs` | PING interval to prevent idle disconnect (keep under 10 min) |
 | `target.address` | TCP address of the target service |
-| `http.listenPort` | HTTP port for the `/conn-ids` endpoint (used by the Cloud Function on cold start) |
+| `http.listenPort` | HTTP port for the recovery endpoint. **Required** (must be > 0) — the Cloud Function polls it on cold start; without it the tunnel breaks as soon as a function instance recycles. |
+| `http.path` | URL path of the recovery endpoint. Default `/conn-ids`. Change it to something random of your own — see [Customizing endpoint paths](#customizing-endpoint-paths). The same full URL (host + path) must be set in the Cloud Function's `HTTP_URL` env var. |
 | `writeCoalescing.enabled` | Coalesce small packets into a single frame (analogous to Nagle's algorithm). Reduces the number of `wsSend` calls and increases throughput |
 | `writeCoalescing.delayMs` | Maximum buffering delay before sending (ms). Data is sent earlier if the buffer reaches 32 KB. Recommended: 10–100 ms |
 | `wsApi.mode` | `grpc` (the only option in v4) |
@@ -201,7 +206,7 @@ logging:
 
 | Endpoint | Method | Description |
 |-----------|-------|----------|
-| `/conn-ids` | GET | Returns `{"adapterConnId":"...","helperConnId":"..."}`. Authorization: `Bearer <authToken>`. |
+| `http.path` (default `/conn-ids`) | GET | Returns `{"adapterConnId":"...","helperConnId":"..."}`. Authorization: `Bearer <authToken>`. |
 
 ---
 
@@ -313,13 +318,13 @@ yc serverless function version create \
   --concurrency 16 \
   --source-path bridge-function.zip \
   --service-account-id $SA_ID \
-  --environment "AUTH_TOKEN=<your-shared-secret>,ADAPTER_URL=<adapter-http-url>"
+  --environment "AUTH_TOKEN=<your-shared-secret>,HTTP_URL=<adapter-http-recovery-url>"
 ```
 
 | Variable | Required | Description |
 |------------|-------------|----------|
 | `AUTH_TOKEN` | Yes | Shared secret (same value as `bridge.authToken`) |
-| `ADAPTER_URL` | Yes | HTTP(S) URL of the adapter (e.g. `https://your-server:3001`). Used to fetch `/conn-ids` on cold start; needed to restore state across multiple instances. |
+| `HTTP_URL` | Yes | Full URL of the adapter's HTTP recovery endpoint, including the path (e.g. `https://your-server:3001/conn-ids`, or whatever you set for `http.path` in the adapter config). Used to fetch connection IDs on cold start; needed to restore state across multiple instances. |
 
 ### 3. Create the API Gateway
 

@@ -18,9 +18,15 @@ bridge:
 target:
   address: "127.0.0.1:1080"
 
-# Optional HTTP endpoint for health / status checks (0 = disabled).
+# HTTP endpoint the cloud function polls on cold start to recover connection
+# IDs. **Required** — without it the tunnel breaks as soon as the cloud
+# function instance recycles. The path is configurable so you don't have to
+# expose a recognisable URL like "/conn-ids" — pick something random of your
+# own and reflect the same value in the cloud function's HTTP_URL env var
+# (full URL: scheme://host:port + path).
 http:
-  listenPort: 0
+  listenPort: 8080
+  path: "/conn-ids"
 
 
 # Nagle-like write coalescing: buffer small TCP reads into larger DATA frames.

@@ -2,13 +2,16 @@
 // Discovery service: exchanges connection IDs between adapter and helper.
 // Optionally relays helper's stream frames to the adapter (relay mode).
 //
-// Env: AUTH_TOKEN (required), ADAPTER_URL (required — for /conn-ids fetch on init)
+// Env: AUTH_TOKEN (required), HTTP_URL (required — full URL of the adapter's
+//      HTTP endpoint, e.g. https://your-server:3001/conn-ids, used to recover
+//      connection IDs on cold start; the path part is whatever you set in
+//      the adapter's http.path config).
 
 const https = require('https');
 const http = require('http');
 
 const AUTH_TOKEN = process.env.AUTH_TOKEN;
-const ADAPTER_URL = process.env.ADAPTER_URL || null;
+const HTTP_URL = process.env.HTTP_URL || null;
 
 const httpsAgent = new https.Agent({ keepAlive: true });
 const httpAgent = new http.Agent({ keepAlive: true });
@@ -100,8 +103,8 @@ function httpGet(url, headers) {
 // adapter can refresh its cached IAM token without needing a PING/PONG round
 // trip. The init-time call (no handler context yet) skips this header.
 async function fetchConnIds(iamToken) {
-  if (!ADAPTER_URL) return;
-  const url = ADAPTER_URL.replace(/\/+$/, '') + '/conn-ids';
+  if (!HTTP_URL) return;
+  const url = HTTP_URL;
   const headers = { 'Authorization': 'Bearer ' + AUTH_TOKEN };
   if (iamToken) headers['X-IAM-Token'] = iamToken;
   for (let attempt = 1; attempt <= 3; attempt++) {

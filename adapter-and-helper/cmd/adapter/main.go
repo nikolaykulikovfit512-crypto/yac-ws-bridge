@@ -31,6 +31,14 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
+	// The HTTP recovery endpoint is required: the cloud function polls it on
+	// cold start to recover adapter/helper connection IDs. Without it the
+	// tunnel will appear to work briefly, but break as soon as the function
+	// instance recycles.
+	if cfg.HTTP.ListenPort <= 0 {
+		log.Fatalf("http.listenPort must be > 0 (the cloud function needs the recovery endpoint to be reachable; set e.g. 8080 in adapter.config.yaml)")
+	}
+
 	log.SetOutput(os.Stderr)
 	log.SetFlags(log.LstdFlags)
 
@@ -168,17 +176,25 @@ func main() {
 		cancel()
 	}()
 
-	// HTTP server for /conn-ids
-	if cfg.HTTP.ListenPort > 0 {
+	// HTTP server for the conn-ids endpoint (path configurable via http.path).
+	// Required — the cloud function calls it on cold start to recover state.
+	{
+		httpPath := cfg.HTTP.Path
+		if httpPath == "" {
+			httpPath = "/conn-ids"
+		}
+		if !strings.HasPrefix(httpPath, "/") {
+			httpPath = "/" + httpPath
+		}
 		mux := http.NewServeMux()
-		mux.HandleFunc("/conn-ids", func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc(httpPath, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				w.WriteHeader(http.StatusMethodNotAllowed)
 				return
 			}
 			token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 			if token != cfg.Bridge.AuthToken {
-				log.Printf("[WARN] /conn-ids unauthorized request from %s", r.RemoteAddr)
+				log.Printf("[WARN] %s unauthorized request from %s", httpPath, r.RemoteAddr)
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
@@ -187,17 +203,17 @@ func main() {
 			// the periodic PING loop low-frequency / peer-gated.
 			if iamToken := r.Header.Get("X-IAM-Token"); iamToken != "" {
 				ups.SetIAMToken(iamToken)
-				log.Printf("[INFO] /conn-ids refreshed IAM token from %s tokenLen=%d", r.RemoteAddr, len(iamToken))
+				log.Printf("[INFO] %s refreshed IAM token from %s tokenLen=%d", httpPath, r.RemoteAddr, len(iamToken))
 			}
 			own := ups.OwnConnID()
 			peer := ups.PeerConnID()
 			helpers := ups.Helpers()
 			if own == "" {
-				log.Printf("[INFO] /conn-ids requested from %s but adapter not connected yet", r.RemoteAddr)
+				log.Printf("[INFO] %s requested from %s but adapter not connected yet", httpPath, r.RemoteAddr)
 				w.WriteHeader(http.StatusServiceUnavailable)
 				return
 			}
-			log.Printf("[INFO] /conn-ids requested from %s adapterConnId=%s helpers=%d", r.RemoteAddr, own, len(helpers))
+			log.Printf("[INFO] %s requested from %s adapterConnId=%s helpers=%d", httpPath, r.RemoteAddr, own, len(helpers))
 			// helpers field is the multi-helper map (preferred by the cloud
 			// function on cold-start recovery). helperConnId is preserved for
 			// compatibility with older cloud-function deployments that only
